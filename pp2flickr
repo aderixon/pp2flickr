@@ -1,0 +1,439 @@
+#!/usr/bin/perl -w
+# $Id$
+# Adapted from fp2flickr, ajr
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+use strict;
+use warnings;
+use Flickr::Upload;
+use Getopt::Long;
+use Pod::Usage;
+use LWP::UserAgent;
+use HTML::TreeBuilder;
+
+# get your own key and secret from http://www.flickr.com/services/api/key.gne
+my $api_key = '<api_key>';
+my $not_so_secret = '<api_secret>';
+
+my %args;
+my @tags = ();
+my $help = 0;
+my $man = 0;
+my $auth = 0;
+
+if( open CONFIG, "< $ENV{HOME}/.flickrrc" ) {
+	while( <CONFIG> ) {
+		chomp;
+		s/#.*$//;	# strip comments
+
+		next unless m/^\s*([a-z_]+)=(.+)\s*$/io;
+		if( $1 eq "key" ) {
+			$api_key = $2;
+		} elsif( $1 eq "secret" ) {
+			$not_so_secret = $2;
+		} else {
+			$args{$1} = $2;
+		}
+	}
+	close CONFIG;
+}
+
+GetOptions(
+	'help|?' => \$help,
+	'man' => \$man,
+	'tag=s' => \@tags,
+	'uri=s' => sub { $args{$_[0]} = $_[1] },
+	'auth_token=s' => sub { $args{$_[0]} = $_[1] },
+	'public=i' => sub { $args{is_public} = $_[1] },
+	'friend=i' => sub { $args{is_friend} = $_[1] },
+	'family=i' => sub { $args{is_family} = $_[1] },
+	'title=s' => sub { $args{$_[0]} = $_[1] },
+	'description=s' => sub { $args{$_[0]} = $_[1] },
+	'key=s' => \$api_key,
+	'secret=s' => \$not_so_secret,
+	'auth' => \$auth,
+) or pod2usage(2);
+pod2usage(1) if $help;
+pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+
+my $version = qw($Revision: 0.1 $)[1];
+
+my $ua = Flickr::Upload->new( {'key' => $api_key, 'secret' => $not_so_secret} );
+$ua->cookie_jar({ file => "$ENV{HOME}/.cookies.txt" });	# handle PP auth
+my $api = new Flickr::API( {'key' => $api_key, 'secret' => $not_so_secret} );
+$ua->agent( "pp2flickr/$version" );
+
+if( $auth ) {
+	# The user wants to authenticate. There's really no nice way to handle this.
+	# So we have to spit out a URL, then hang around or something until
+	# the user hits enter, then exchange the frob for a token, then tell the user what
+	# the token is and hope they care enough to stick it into .flickrrc so they
+	# only have to go through this crap once.
+
+	# 1. get a frob
+	my $frob = getFrob( $ua );
+
+	# 2. get a url for the frob
+	my $url = $ua->request_auth_url('write', $frob);
+
+	# 3. tell the user what to do with it
+	print "1. Enter the following URL into your browser\n\n",
+	      "$url\n\n",
+	      "2. Follow the instructions on the web page\n",
+			"3. Hit <Enter> when finished.\n\n";
+	
+	# 4. wait for enter.
+	<STDIN>;
+
+	# 5. Get the token from the frob
+	my $auth_token = getToken( $ua, $frob );
+	die "Failed to get authentication token!" unless defined $auth_token;
+	
+	# 6. Tell the user what they won.
+	print "You authentication token for this application is\n\t\t", $auth_token, "\n";
+	$args{'auth_token'} = $auth_token;
+	exit 0;
+	
+}
+
+
+pod2usage(1) unless exists $args{'auth_token'};
+pod2usage(1) unless @ARGV;
+
+$args{'tags'} = join( " ", @tags ) if @tags;
+
+# pipeline things by uploading first, waiting for photo ids second.
+$args{'async'} = 1;
+my %tickets;
+my @completed;
+
+$| = 1;
+while(my $collection = shift @ARGV ) {
+   getFotoPics($ua,$collection);
+}
+
+# check
+print "Waiting for upload results (ctrl-C if you don't care)...\n";
+do {
+	sleep 1;
+	my @checked = $ua->check_upload( keys %tickets );
+	for( @checked ) {
+		if( $_->{complete} == 0 ) {
+			# not done yet, don't do anythig
+		} elsif( $_->{complete} == 1 ) {
+			# uploaded, got photoid
+			print "$tickets{$_->{id}} is at " .
+				"http://www.flickr.com/tools/uploader_edit.gne?ids=$_->{photoid}\n";
+		        push @completed, $_->{photoid};
+			delete $tickets{$_->{id}};
+		} else {
+			print "$tickets{$_->{id}} failed to get photoid\n";
+			delete $tickets{$_->{id}};
+		}
+	}
+} while( %tickets );
+
+print "\n\nGo here:\n",
+      "http://www.flickr.com/tools/uploader_edit.gne?ids=",
+      (join ',', @completed ), "\n";
+
+exit 0;
+
+sub response_tag {
+	my $t = shift;
+	my $name = shift;
+	my $tag = shift;
+
+	return undef unless defined $t and exists $t->{'children'};
+
+	for my $n ( @{$t->{'children'}} ) {
+		next unless $n->{'name'} eq $name;
+		next unless exists $n->{'children'};
+
+		for my $m (@{$n->{'children'}} ) {
+			next unless exists $m->{'name'}
+				and $m->{'name'} eq $tag
+				and exists $m->{'children'};
+
+			return $m->{'children'}->[0]->{'content'};
+		}
+	}
+	return undef;
+}
+
+sub getFrob {
+	my $ua = shift;
+
+	my $res = $ua->execute_method("flickr.auth.getFrob");
+	return undef unless defined $res and $res->{success};
+
+	# FIXME: error checking, please. At least look for the node named 'frob'.
+	return $res->{tree}->{children}->[1]->{children}->[0]->{content};
+}
+
+sub getToken {
+	my $ua = shift;
+	my $frob = shift;
+
+	my $res = $ua->execute_method("flickr.auth.getToken",
+		{ 'frob' => $frob } );
+	return undef unless defined $res and $res->{success};
+
+	# FIXME: error checking, please.
+	return $res->{tree}->{children}->[1]->{children}->[1]->{children}->[0]->{content};
+}
+
+
+sub getFotoPics {
+  my ($ua,$uri) = (shift,shift);
+  print "Looking at index page $uri\n";
+
+  my @pics;
+
+  my $response = $ua->get($uri);
+
+  if($response->is_success) {
+     my $tree = HTML::TreeBuilder->new_from_content($response->content);
+     #print STDERR $tree->dump;	# DEBUG
+     # for all thumbnail images (URL = ".../thumbs/...")
+     foreach my $thumb  ( $tree->look_down ( "_tag", "img",
+                                           "src", qr|/gallery/data/\d+/thumbs/|,
+					  )) {
+
+	my $filnobj=$thumb->attr('alt');	# alt contains orig filename
+	# go back out, find enclosing href anchor URI
+        my $relurl= URI->new( $thumb->look_up(
+	         '_tag', "a",
+		 'href', qr/showphoto\.php/,	# TODO: show(photo|gallery)\.php
+		 )->attr('href'));
+	if($relurl) {	# if found
+	   # TODO: check URL, recurse if showgallery.php, else...
+	   #if ($relurl =~ /showgallery.php/) {
+	   #  recurse($relurl->abs);
+	   #} else {
+	   my $absurl=$relurl->abs($uri);	# make absolute URL
+	   # get description and filename if poss from relevant classes
+	   #print STDERR "relurl is $relurl\n";	# DEBUG
+	   $relurl=~s/(.*\/showphoto.php\?).*(photo=[0-9]+)&.*/$1$2/;	# strip every arg but photo ID
+	   my $relurlesc=quotemeta($relurl);
+	   # find next occurrence of URL with cat arg = title link to photo
+	   my $descobj=$tree->look_down('_tag', 'a', "href", qr/$relurlesc&cat=\d+/);
+	   my $desc = "Image";	# default name if none found
+	   if($descobj) {
+	      $desc = $descobj->as_text;	# prefer description (title)
+	   } elsif ($filnobj) {
+	      $desc = $filnobj;	# else filename
+	   }
+	   #print STDERR "Desc = $desc\n";	# DEBUG
+	   procImagePage($ua, $absurl, $desc);	# load page
+	}
+     }
+
+     # look for next page if any:
+     my $nextimg = $tree->look_down(
+                 "_tag", "a",
+                 "href", qr/&page=\d+/,
+		 sub { $_[0]->as_HTML =~ m{raquo} }	# find >> page link
+		 );
+     my $nexturl;
+     if($nextimg) {
+	# find enclosing href URI
+	$nexturl=$nextimg->attr('href');
+     }
+     if($nexturl) {
+        my $relurl=URI->new($nexturl);
+	my $absurl=$relurl->abs($uri);	# URL of next page
+
+	getFotoPics($ua,$absurl);	# recurse
+     }
+  }
+}
+
+# process single image page
+sub procImagePage {
+   my ($ua, $url,$description) = (shift,shift,shift);
+
+   my $response=$ua->get($url);
+   if($response) {
+      my $tree=HTML::TreeBuilder->new_from_content($response->content);
+      #print STDERR $tree->dump;	# DEBUG
+      # get image URL via href
+      my $relimgurl=URI->new($tree->look_down("_tag", "img", "width", qr/\d+/, "height", qr/\d+/, "src", qr|/gallery/data/\d+/|)->attr('src'));
+      my $absimgurl=$relimgurl->abs($url);
+      my $longdescobj=$tree->look_down("_tag", 'div', "align", "center", "class", undef)->look_down("_tag", 'span', "class", "desc");
+      my $longdesc="";
+      if ($longdescobj) {
+      	$longdesc=$longdescobj->as_text();
+      } else {
+      	$longdesc="";
+      }
+      #print STDERR "Description = $longdesc\n";	# DEBUG
+      # convert keywords to extra tags
+      my $savetags=$args{'tags'};	# save original list
+      my @keywords = ();
+      for my $keyword ($tree->look_down("_tag", 'a', "href", qr/search.php\?keywords=/)) {
+        push(@keywords, $keyword->content_list);
+      }
+      if (@keywords) {
+        #print STDERR "Extra tags = ", join(' ', @keywords), "\n";	# DEBUG
+      	$args{'tags'}=$args{'tags'} . ' ' . join(' ', @keywords);
+      }
+
+      print "Fetching image $description from \n\t$absimgurl\n";
+      
+      $response = $ua->get($absimgurl);	# retrieve image URL
+      unless($response->is_success) {
+         die "Failed to get image\n";
+	 }
+      $args{'title'} = $description;
+      $args{'description'} = $longdesc || "";	# no desc or tags!
+
+      # prepare Flickr upload request
+      my $req = $ua->make_upload_request( %args );
+      $req->remove_header('Content-Length');
+
+      my $picture = new HTTP::Message(
+         [
+	     'Content-Disposition' => qq(form-data; name="photo"; filename="fotopic.jpg"),
+	     'Content-Type' => 'image/jpeg',
+	     ],
+	     $response->content,
+	     );
+      $req->add_part($picture);
+
+      print "Uploading $description ...\n";
+      my $rc=$ua->upload_request($req);	# upload to Flickr
+      #my $rc=1;	# DEBUG
+
+      $args{'tags'}=$savetags;	# restore original tag list
+
+      # let the caller know how many images weren't uploaded
+      # exit (1+@ARGV) unless defined $rc;
+
+	# check those later
+      $tickets{$rc} = $description;
+
+   }
+}
+ 
+
+__END__
+
+=head1 NAME
+
+pp2flickr - Migrate photo collections from Photopost to C<flickr.com>
+
+=head1 SYNOPSIS
+
+pp2flickr [--auth] --auth_token <auth_token> [--title <title>]
+	[--description description] [--public <0|1>] [--friend <0|1>]
+	[--family <0|1>] [--tag <tag>] <photopost album url...>
+
+=head1 DESCRIPTION
+
+Fetches images from a Photopost (L<www.photopost.com>) album and uploads them to the L<Flickr.com> service.
+Heavily based on fp2flickr and flickr_upload, from the L<Flickr::Upload> distribution.
+Flickr::Upload is a prerequisite.
+
+During the migration, image titles and descriptions will be carried over to Flickr and any keywords added to the image tags. Note that the Flickr API does not allow the posted date of an image to be set at upload time, so the original posting dates are ignored. Image ordering is indeterminate, but will likely be the reverse of the PhotoPost presentation, so sort the album first and use that URL.
+
+pp2flickr has been designed and coded to handle PhotographyBlog (L<www.photographyblog.com>) galleries and will probably break on other gallery sites unless they use the same HTML formatting. Edit the code to handle other sites.
+
+=head1 OPTIONS
+
+=over 4
+
+=item --auth
+
+The C<--auth> flag will cause L<pp2flickr> to generate an authentication token
+against its API key and secret (or, if you want, your own specific key and secret).
+This process requires the caller to have a browser handy so they can cut and paste a
+url. The resulting token should be kept somewhere like C<~/.flickrrc> since it's
+necessary for actually uploading images.
+
+=item --auth_token <auth_token>
+
+Authentication token. Required.
+
+=item --title <title>
+
+Title to use on all the images. Optional.
+
+=item --description <description>
+
+Description to use on all the images. Optional.
+
+=item --public <0|1>
+
+Override the default C<is_public> access control. Optional.
+
+=item --friend <0|1>
+
+Override the default C<is_friend> access control. Optional.
+
+=item --family <0|1>
+
+Override the default C<is_friend> access control. Optional.
+
+=item --tag <tag>
+
+Images are tagged with C<tag>. Multiple C<--tag> options can be given, or
+you can just put them all into a single space-separated list.
+
+=item --key <api_key>
+
+=item --secret <secret>
+
+Your own API key and secret. This is useful if you want to use L<flickr_upload> in
+auth mode as a token generator. You need both C<key> and C<secret>. Both C<key> and
+C<secret> can be placed in C<~/.flickrrc>, allowing you to mix L<flickr_upload> with
+your own scripts using a single API key and authentication token.
+
+=item <photos...>
+
+List of photos to upload. Uploading stops as soon as a failure is detected
+during the upload. The script exit code will indicate the number of images
+on the command line that were not uploaded. For each uploaded image, a Flickr URL
+will be generated. L<pp2flickr> uses asynchronous uploading so while the image is
+usually transferred fairly quickly, it might take a while before it's actually
+available to users. L<pp2flickr> will wait around for that to complete, but be
+aware that delays of upwards of thirty minutes have (rarely) be know to occur.
+
+=back
+
+=head1 CONFIGURATION
+
+To avoid having to remember authentication tokens and such (or have them show up
+in the process table listings), default values will
+be read from C<$HOME/.flickrrc> if it exists. Any field defined there can, of
+course, be overridden on the command line. For example:
+
+	# my config at $HOME/.flickrrc
+	auth_token=334455
+	is_public=0
+	is_friend=1
+	is_family=1
+
+=head1 BUGS
+
+Error handling could be better.
+
+It can only handle individual albums, not a page showing many albums.
+
+=head1 AUTHOR
+
+Christophe Beauregard, L<cpb@cpan.org>.
+John Hartnup, L<john.h@rtnup.net>.
+Ade Rixon, L<tech@big-bubbles.fluff.org>.
+
+=head1 SEE ALSO
+
+L<flickr.com>
+
+L<Flickr::Upload>
+
+L<fp2flickr>
+
+=cut
